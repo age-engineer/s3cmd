@@ -276,7 +276,7 @@ def cmd_object_put(args):
     destination_base_uri = S3Uri(args.pop())
     if destination_base_uri.type != 's3':
         raise ParameterError("Destination must be S3Uri. Got: %s" % destination_base_uri)
-    destination_base = str(destination_base_uri)
+    destination_base = unicode(destination_base_uri)
 
     if len(args) == 0:
         raise ParameterError("Nothing to upload. Expecting a local file or directory.")
@@ -322,7 +322,7 @@ def cmd_object_put(args):
         uri_final = S3Uri(local_list[key]['remote_uri'])
 
         extra_headers = copy(cfg.extra_headers)
-        full_name_orig = local_list[key]['full_name']
+        full_name_orig = local_list[key]['full_name_unicode']
         full_name = full_name_orig
         seq_label = "[%d of %d]" % (seq, local_count)
         if Config().encrypt:
@@ -1052,7 +1052,7 @@ def cmd_sync_local2remote(args):
             destination_base_uri = S3Uri(dest)
             if destination_base_uri.type != 's3':
                 raise ParameterError("Destination must be S3Uri. Got: %s" % destination_base_uri)
-            destination_base = str(destination_base_uri)
+            destination_base = unicode(destination_base_uri)
             _child(destination_base, local_list)
             return destination_base_uri
 
@@ -1067,7 +1067,7 @@ def cmd_sync_local2remote(args):
             destination_base_uri = S3Uri(dest)
             if destination_base_uri.type != 's3':
                 raise ParameterError("Destination must be S3Uri. Got: %s" % destination_base_uri)
-            destination_base = str(destination_base_uri)
+            destination_base = unicode(destination_base_uri)
             child_pid = os.fork()
             if child_pid == 0:
                 _child(destination_base, local_list)
