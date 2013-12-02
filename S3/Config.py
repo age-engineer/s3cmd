@@ -13,8 +13,8 @@ from SortedDict import SortedDict
 import httplib
 try:
     import json
-except ImportError, e:
-    pass
+except ImportError:
+    import simplejson as json
 
 class Config(object):
     _instance = None
@@ -36,11 +36,8 @@ class Config(object):
     human_readable_sizes = False
     extra_headers = SortedDict(ignore_case = True)
     force = False
-    server_side_encryption = False
     enable = None
     get_continue = False
-    put_continue = False
-    upload_id = None
     skip_existing = False
     recursive = False
     acl_public = None
@@ -67,7 +64,6 @@ class Config(object):
     delete_removed = False
     delete_after = False
     delete_after_fetch = False
-    max_delete = -1
     _doc['delete_removed'] = "[sync] Remove remote S3 objects when local file has been deleted"
     delay_updates = False
     gpg_passphrase = ""
@@ -78,7 +74,6 @@ class Config(object):
     bucket_location = "US"
     default_mime_type = "binary/octet-stream"
     guess_mime_type = True
-    use_mime_magic = True
     mime_type = ""
     enable_multipart = True
     multipart_chunk_size_mb = 15    # MB
@@ -91,7 +86,6 @@ class Config(object):
     debug_exclude = {}
     debug_include = {}
     encoding = "utf-8"
-    add_content_encoding = True
     urlencoding_mode = "normal"
     log_target_prefix = ""
     reduced_redundancy = False
@@ -105,10 +99,8 @@ class Config(object):
     website_error = ""
     website_endpoint = "http://%(bucket)s.s3-website-%(location)s.amazonaws.com/"
     additional_destinations = []
-    files_from = []
     cache_file = ""
     add_headers = ""
-    ignore_failed_copy = False
 
     ## Creating a singleton
     def __new__(self, configfile = None):
@@ -124,21 +116,15 @@ class Config(object):
                 if 'AWS_CREDENTIAL_FILE' in os.environ:
                     self.env_config()
             if len(self.access_key)==0:
-                self.role_config()
+                self.role_config()  
 
     def role_config(self):
-        if sys.version_info[0] * 10 + sys.version_info[1] < 26:
-            error("IAM authentication requires Python 2.6 or newer")
-            raise
-        if not 'json' in sys.modules:
-            error("IAM authentication not available -- missing module json")
-            raise
+        conn = httplib.HTTPConnection(host='169.254.169.254',timeout=0.1)
         try:
-            conn = httplib.HTTPConnection(host='169.254.169.254', timeout = 2)
             conn.request('GET', "/latest/meta-data/iam/security-credentials/")
             resp = conn.getresponse()
             files = resp.read()
-            if resp.status == 200 and len(files)>1:
+            if resp.status == 200 and len(files)>1:               
                 conn.request('GET', "/latest/meta-data/iam/security-credentials/%s"%files)
                 resp=conn.getresponse()
                 if resp.status == 200:
@@ -181,14 +167,16 @@ class Config(object):
                     elif data["orig_key"]=="AWSSecretKey":
                         data["key"] = "secret_key"
                     else:
-                        del data["key"]
+                        del data["key"]                    
                     if "key" in data:
                         Config().update_option(data["key"], data["value"])
                         if data["key"] in ("access_key", "secret_key", "gpg_passphrase"):
-                            print_value = ("%s...%d_chars...%s") % (data["value"][:2], len(data["value"]) - 3, data["value"][-1:])
+                            print_value = (data["value"][:2]+"...%d_chars..."+data["value"][-1:]) % (len(data["value"]) - 3)
                         else:
                             print_value = data["value"]
                         debug("env_Config: %s->%s" % (data["key"], print_value))
+                
+        
 
     def option_list(self):
         retval = []
@@ -279,7 +267,7 @@ class ConfigParser(object):
                     data["value"] = data["value"][1:-1]
                 self.__setitem__(data["key"], data["value"])
                 if data["key"] in ("access_key", "secret_key", "gpg_passphrase"):
-                    print_value = ("%s...%d_chars...%s") % (data["value"][:2], len(data["value"]) - 3, data["value"][-1:])
+                    print_value = (data["value"][:2]+"...%d_chars..."+data["value"][-1:]) % (len(data["value"]) - 3)
                 else:
                     print_value = data["value"]
                 debug("ConfigParser: %s->%s" % (data["key"], print_value))

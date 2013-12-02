@@ -14,12 +14,10 @@ from HashCache import HashCache
 from logging import debug, info, warning, error
 
 import os
-import sys
 import glob
 import copy
-import re
 
-__all__ = ["fetch_local_list", "fetch_remote_list", "compare_filelists", "filter_exclude_include"]
+__all__ = ["fetch_local_list", "fetch_remote_list", "compare_filelists", "filter_exclude_include", "parse_attrs_header"]
 
 def _fswalk_follow_symlinks(path):
     '''
@@ -142,45 +140,7 @@ def handle_exclude_include_walk(root, dirs, files):
         else:
             debug(u"PASS: %r" % (file))
 
-
-def _get_filelist_from_file(cfg, local_path):
-    def _append(d, key, value):
-        if key not in d:
-            d[key] = [value]
-        else:
-            d[key].append(value)
-
-    filelist = {}
-    for fname in cfg.files_from:
-        if fname == u'-':
-            f = sys.stdin
-        else:
-            try:
-                f = open(fname, 'r')
-            except IOError, e:
-                warning(u"--files-from input file %s could not be opened for reading (%s), skipping." % (fname, e.strerror))
-                continue
-
-        for line in f:
-            line = line.strip()
-            line = os.path.normpath(os.path.join(local_path, line))
-            dirname = os.path.dirname(line)
-            basename = os.path.basename(line)
-            _append(filelist, dirname, basename)
-        if f != sys.stdin:
-            f.close()
-
-    # reformat to match os.walk()
-    result = []
-    keys = filelist.keys()
-    keys.sort()
-    for key in keys:
-        values = filelist[key]
-        values.sort()
-        result.append((key, [], values))
-    return result
-
-def fetch_local_list(args, is_src = False, recursive = None):
+def fetch_local_list(args, recursive = None):
     def _get_filelist_local(loc_list, local_uri, cache):
         info(u"Compiling list of local files...")
 
@@ -195,15 +155,11 @@ def fetch_local_list(args, is_src = False, recursive = None):
         if local_uri.isdir():
             local_base = deunicodise(local_uri.basename())
             local_path = deunicodise(local_uri.path())
-            if is_src and len(cfg.files_from):
-                filelist = _get_filelist_from_file(cfg, local_path)
-                single_file = False
+            if cfg.follow_symlinks:
+                filelist = _fswalk_follow_symlinks(local_path)
             else:
-                if cfg.follow_symlinks:
-                    filelist = _fswalk_follow_symlinks(local_path)
-                else:
-                    filelist = _fswalk_no_symlinks(local_path)
-                single_file = False
+                filelist = _fswalk_no_symlinks(local_path)
+            single_file = False
         else:
             local_base = ""
             local_path = deunicodise(local_uri.dirname())
@@ -251,11 +207,7 @@ def fetch_local_list(args, is_src = False, recursive = None):
         return loc_list, single_file
 
     def _maintain_cache(cache, local_list):
-        # if getting the file list from files_from, it is going to be
-        # a subset of the actual tree.  We should not purge content
-        # outside of that subset as we don't know if it's valid or
-        # not.  Leave it to a non-files_from run to purge.
-        if cfg.cache_file and len(cfg.files_from) == 0:
+        if cfg.cache_file:
             cache.mark_all_for_purge()
             for i in local_list.keys():
                 cache.unmark_for_purge(local_list[i]['dev'], local_list[i]['inode'], local_list[i]['mtime'], local_list[i]['size'])
@@ -305,20 +257,6 @@ def fetch_local_list(args, is_src = False, recursive = None):
     return local_list, single_file
 
 def fetch_remote_list(args, require_attribs = False, recursive = None):
-    def _get_remote_attribs(uri, remote_item):
-        response = S3(cfg).object_info(uri)
-        remote_item.update({
-        'size': int(response['headers']['content-length']),
-        'md5': response['headers']['etag'].strip('"\''),
-        'timestamp' : dateRFC822toUnix(response['headers']['date'])
-        })
-        try:
-            md5 = response['s3cmd-attrs']['md5']
-            remote_item.update({'md5': md5})
-            debug(u"retreived md5=%s from headers" % md5)
-        except KeyError:
-            pass
-
     def _get_filelist_remote(remote_uri, recursive = True):
         ## If remote_uri ends with '/' then all remote files will have
         ## the remote_uri prefix removed in the relative path.
@@ -349,7 +287,7 @@ def fetch_remote_list(args, require_attribs = False, recursive = None):
         rem_list = FileDict(ignore_case = False)
         break_now = False
         for object in response['list']:
-            if object['Key'] == rem_base_original and object['Key'][-1] != "/":
+            if object['Key'] == rem_base_original and object['Key'][-1] != os.path.sep:
                 ## We asked for one file and we got that file :-)
                 key = os.path.basename(object['Key'])
                 object_uri_str = remote_uri_original.uri()
@@ -368,9 +306,7 @@ def fetch_remote_list(args, require_attribs = False, recursive = None):
                 'dev' : None,
                 'inode' : None,
             }
-            if rem_list[key]['md5'].find("-") > 0: # always get it for multipart uploads
-                _get_remote_attribs(S3Uri(object_uri_str), rem_list[key])
-            md5 = rem_list[key]['md5']
+            md5 = object['ETag'][1:-1]
             rem_list.record_md5(key, md5)
             if break_now:
                 break
@@ -400,15 +336,19 @@ def fetch_remote_list(args, require_attribs = False, recursive = None):
                 remote_list.record_md5(key, objectlist.get_md5(key))
     else:
         for uri in remote_uris:
-            uri_str = unicode(uri)
+            uri_str = str(uri)
             ## Wildcards used in remote URI?
             ## If yes we'll need a bucket listing...
-            wildcard_split_result = re.split("\*|\?", uri_str, maxsplit=1)
-            if len(wildcard_split_result) == 2: # wildcards found
-                prefix, rest = wildcard_split_result
+            if uri_str.find('*') > -1 or uri_str.find('?') > -1:
+                first_wildcard = uri_str.find('*')
+                first_questionmark = uri_str.find('?')
+                if first_questionmark > -1 and first_questionmark < first_wildcard:
+                    first_wildcard = first_questionmark
+                prefix = uri_str[:first_wildcard]
+                rest = uri_str[first_wildcard+1:]
                 ## Only request recursive listing if the 'rest' of the URI,
                 ## i.e. the part after first wildcard, contains '/'
-                need_recursion = '/' in rest
+                need_recursion = rest.find('/') > -1
                 objectlist = _get_filelist_remote(S3Uri(prefix), recursive = need_recursion)
                 for key in objectlist:
                     ## Check whether the 'key' matches the requested wildcards
@@ -425,13 +365,27 @@ def fetch_remote_list(args, require_attribs = False, recursive = None):
                     'object_key': uri.object()
                 }
                 if require_attribs:
-                    _get_remote_attribs(uri, remote_item)
+                    response = S3(cfg).object_info(uri)
+                    remote_item.update({
+                    'size': int(response['headers']['content-length']),
+                    'md5': response['headers']['etag'].strip('"\''),
+                    'timestamp' : dateRFC822toUnix(response['headers']['date'])
+                    })
+                    # get md5 from header if it's present.  We would have set that during upload
+                    if response['headers'].has_key('x-amz-meta-s3cmd-attrs'):
+                        attrs = parse_attrs_header(response['headers']['x-amz-meta-s3cmd-attrs'])
+                        if attrs.has_key('md5'):
+                            remote_item.update({'md5': attrs['md5']})
 
                 remote_list[key] = remote_item
-                md5 = remote_item.get('md5')
-                if md5:
-                    remote_list.record_md5(key, md5)
     return remote_list
+
+def parse_attrs_header(attrs_header):
+    attrs = {}
+    for attr in attrs_header.split("/"):
+        key, val = attr.split(":")
+        attrs[key] = val
+    return attrs
 
 
 def compare_filelists(src_list, dst_list, src_remote, dst_remote, delay_updates = False):

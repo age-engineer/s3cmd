@@ -6,7 +6,6 @@
 import sys
 import os, os.path
 import time
-import errno
 import httplib
 import logging
 import mimetypes
@@ -404,25 +403,23 @@ class S3(object):
         if extra_headers:
             headers.update(extra_headers)
 
-        ## Set server side encryption
-        if self.config.server_side_encryption:
-            headers["x-amz-server-side-encryption"] = "AES256"
-
         ## MIME-type handling
         content_type = self.config.mime_type
-        content_charset = None
+        content_encoding = None
         if filename != "-" and not content_type and self.config.guess_mime_type:
-            (content_type, content_charset) = mime_magic(filename)
+            (content_type, content_encoding) = mime_magic(filename)
         if not content_type:
             content_type = self.config.default_mime_type
-        if not content_charset:
-            content_charset = self.config.encoding.upper()
+        if not content_encoding:
+            content_encoding = self.config.encoding.upper()
 
         ## add charset to content type
-        if self.add_encoding(filename, content_type) and content_charset is not None:
-            content_type = content_type + "; charset=" + content_charset
+        if self.add_encoding(filename, content_type) and content_encoding is not None:
+            content_type = content_type + "; charset=" + content_encoding
 
         headers["content-type"] = content_type
+        #if content_encoding is not None:
+        #    headers["content-encoding"] = content_encoding
 
         ## Other Amazon S3 attributes
         if self.config.acl_public:
@@ -442,31 +439,6 @@ class S3(object):
             return self.send_file_multipart(file, headers, uri, size)
 
         ## Not multipart...
-        if self.config.put_continue:
-            # Note, if input was stdin, we would be performing multipart upload.
-            # So this will always work as long as the file already uploaded was
-            # not uploaded via MultiUpload, in which case its ETag will not be
-            # an md5.
-            try:
-                info = self.object_info(uri)
-            except:
-                info = None
-
-            if info is not None:
-                remote_size = int(info['headers']['content-length'])
-                remote_checksum = info['headers']['etag'].strip('"')
-                if size == remote_size:
-                    checksum = calculateChecksum('', file, 0, size, self.config.send_chunk)
-                    if remote_checksum == checksum:
-                        warning("Put: size and md5sum match for %s, skipping." % uri)
-                        return
-                    else:
-                        warning("MultiPart: checksum (%s vs %s) does not match for %s, reuploading."
-                                % (remote_checksum, checksum, uri))
-                else:
-                    warning("MultiPart: size (%d vs %d) does not match for %s, reuploading."
-                            % (remote_size, size, uri))
-
         headers["content-length"] = size
         request = self.create_request("OBJECT_PUT", uri = uri, headers = headers)
         labels = { 'source' : unicodise(filename), 'destination' : unicodise(uri.uri()), 'extra' : extra_label }
@@ -503,11 +475,6 @@ class S3(object):
             headers["x-amz-storage-class"] = "REDUCED_REDUNDANCY"
         # if extra_headers:
         #   headers.update(extra_headers)
-
-        ## Set server side encryption
-        if self.config.server_side_encryption:
-            headers["x-amz-server-side-encryption"] = "AES256"
-
         request = self.create_request("OBJECT_PUT", uri = dst_uri, headers = headers)
         response = self.send_request(request)
         return response
@@ -566,23 +533,6 @@ class S3(object):
     def delete_policy(self, uri):
         request = self.create_request("BUCKET_DELETE", uri = uri, extra = "?policy")
         debug(u"delete_policy(%s)" % uri)
-        response = self.send_request(request)
-        return response
-
-    def get_multipart(self, uri):
-        request = self.create_request("BUCKET_LIST", bucket = uri.bucket(), extra = "?uploads")
-        response = self.send_request(request)
-        return response
-
-    def abort_multipart(self, uri, id):
-        request = self.create_request("OBJECT_DELETE", uri=uri,
-                                      extra = ("?uploadId=%s" % id))
-        response = self.send_request(request)
-        return response
-
-    def list_multipart(self, uri, id):
-        request = self.create_request("OBJECT_GET", uri=uri,
-                                      extra = ("?uploadId=%s" % id))
         response = self.send_request(request)
         return response
 
@@ -720,9 +670,6 @@ class S3(object):
             response["reason"] = http_response.reason
             response["headers"] = convertTupleListToDict(http_response.getheaders())
             response["data"] =  http_response.read()
-            if response["headers"].has_key("x-amz-meta-s3cmd-attrs"):
-                attrs = parse_attrs_header(response["headers"]["x-amz-meta-s3cmd-attrs"])
-                response["s3cmd-attrs"] = attrs
             debug("Response: " + str(response))
             ConnMan.put(conn)
         except ParameterError, e:
@@ -790,7 +737,6 @@ class S3(object):
         if buffer == '':
             file.seek(offset)
         md5_hash = md5()
-
         try:
             while (size_left > 0):
                 #debug("SendFile: Reading up to %d bytes from '%s' - remaining bytes: %s" % (self.config.send_chunk, file.name, size_left))
@@ -798,7 +744,6 @@ class S3(object):
                     data = file.read(min(self.config.send_chunk, size_left))
                 else:
                     data = buffer
-
                 md5_hash.update(data)
                 conn.c.send(data)
                 if self.config.progress_meter:
@@ -807,7 +752,6 @@ class S3(object):
                 if throttle:
                     time.sleep(throttle)
             md5_computed = md5_hash.hexdigest()
-
             response = {}
             http_response = conn.c.getresponse()
             response["status"] = http_response.status
@@ -928,9 +872,6 @@ class S3(object):
             response["status"] = http_response.status
             response["reason"] = http_response.reason
             response["headers"] = convertTupleListToDict(http_response.getheaders())
-            if response["headers"].has_key("x-amz-meta-s3cmd-attrs"):
-                attrs = parse_attrs_header(response["headers"]["x-amz-meta-s3cmd-attrs"])
-                response["s3cmd-attrs"] = attrs
             debug("Response: %s" % response)
         except ParameterError, e:
             raise
@@ -1021,13 +962,7 @@ class S3(object):
                 warning("Unable to verify MD5. Assume it matches.")
                 response["md5"] = response["headers"]["etag"]
 
-        md5_hash = response["headers"]["etag"]
-        try:
-            md5_hash = response["s3cmd-attrs"]["md5"]
-        except KeyError:
-            pass
-
-        response["md5match"] = md5_hash.find(response["md5"]) >= 0
+        response["md5match"] = response["headers"]["etag"].find(response["md5"]) >= 0
         response["elapsed"] = timestamp_end - timestamp_start
         response["size"] = current_position
         response["speed"] = response["elapsed"] and float(response["size"]) / response["elapsed"] or float(-1)
@@ -1037,14 +972,8 @@ class S3(object):
         debug("ReceiveFile: Computed MD5 = %s" % response["md5"])
         if not response["md5match"]:
             warning("MD5 signatures do not match: computed=%s, received=%s" % (
-                response["md5"], md5_hash))
+                response["md5"], response["headers"]["etag"]))
         return response
 __all__.append("S3")
 
-def parse_attrs_header(attrs_header):
-    attrs = {}
-    for attr in attrs_header.split("/"):
-        key, val = attr.split(":")
-        attrs[key] = val
-    return attrs
 # vim:et:ts=4:sts=4:ai
